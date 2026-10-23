@@ -4,8 +4,13 @@ MCPServer call path, project resolution, error strings, provenance defaults."""
 import asyncio
 import json
 import os
+import sys
 import tempfile
 import unittest
+
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from mcp_types import Implementation
 
 from store_n_recall.config import Config, FactError
 from store_n_recall.server import create_server
@@ -166,6 +171,7 @@ class ValidationViaMcpTests(ServerTestCase):
         # must report a tool error, never crash the process.
         from mcp.server.mcpserver.exceptions import ToolError
         for name, args in (
+            ("store_fact", {"project": "p"}),  # fact required by the schema
             ("store_fact", {"project": "p", "fact": "x", "tags": "repo"}),
             ("store_fact", {"project": "p", "fact": "x", "kind": 5}),
             ("store_fact", {"project": "p", "fact": 42}),
@@ -188,6 +194,17 @@ class ValidationViaMcpTests(ServerTestCase):
         self.assertIsNotNone(
             call(self.mcp, "scour_archives", {"project": "p", "id": str(fid)})["fact"]["archived_at"]
         )
+
+    def test_recall_by_id_pins_record_ignoring_query(self):
+        fact = self.store_one()
+        got = call(self.mcp, "recall_facts", {"project": "proj", "id": fact["id"], "query": "zzz"})
+        self.assertEqual(got["fact"]["id"], fact["id"])
+
+    def test_scour_by_id_active_fact_via_mcp_is_error(self):
+        fact = self.store_one()
+        text = call_raw(self.mcp, "scour_archives", {"project": "proj", "id": fact["id"]})
+        self.assertTrue(text.startswith("error:"), text)
+        self.assertIn("no archived fact", text)
 
     def test_supersede_cross_project_via_mcp(self):
         old = call(self.mcp, "store_fact", {"project": "a", "fact": "x"})
@@ -273,6 +290,121 @@ class IdentityTests(unittest.TestCase):
         )
         fact = store.store_fact("p", "x", agent=agent, session=session)
         self.assertEqual(fact["sources"][0]["agent"], "agent-9")
+
+
+class StdioEndToEndTests(unittest.TestCase):
+    """The real transport: spawn the installed server binary, drive it with an
+    MCP client over stdio. Covers main(), startup with no store file, tool
+    registration, the full lifecycle, provenance from clientInfo, and error
+    strings over the wire."""
+
+    def _run(self, coro):
+        return asyncio.run(asyncio.wait_for(coro, timeout=90))
+
+    def test_full_lifecycle_over_real_stdio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "nested", "facts.db")
+            env = dict(os.environ, STORE_N_RECALL_DB=db)
+            env.pop("STORE_N_RECALL_PROJECT", None)
+
+            async def lifecycle():
+                params = StdioServerParameters(
+                    command=sys.executable, args=["-m", "store_n_recall"], env=env)
+                async with stdio_client(params) as (r, w):
+                    async with ClientSession(
+                        r, w, client_info=Implementation(name="e2e-agent", version="1")
+                    ) as session:
+                        init = await session.initialize()
+                        self.assertEqual(init.server_info.name, "store-n-recall")
+                        tools = await session.list_tools()
+                        names = {t.name for t in tools.tools}
+                        self.assertEqual(names, TOOLS)
+
+                        # advertised schema: fact is required
+                        schema = next(
+                            t for t in tools.tools if t.name == "store_fact"
+                        ).input_schema
+                        self.assertEqual(
+                            schema.get("required", []), ["fact"],
+                            "store_fact must advertise fact as required")
+
+                        # no store file before first call
+                        self.assertFalse(os.path.exists(db))
+
+                        # error path over the wire: no project, no env default
+                        res = await session.call_tool("store_fact", {"fact": "x"})
+                        self.assertFalse(res.is_error)
+                        self.assertTrue(res.content[0].text.startswith("error:"))
+                        self.assertIn("project", res.content[0].text)
+
+                        # store -> provenance from clientInfo
+                        res = await session.call_tool(
+                            "store_fact",
+                            {"project": "e2e", "fact": "the build is offline",
+                             "tags": ["build"], "kind": "gotcha", "confidence": 0.9},
+                        )
+                        stored = json.loads(res.content[0].text)
+                        self.assertEqual(stored["sources"][0]["agent"], "e2e-agent")
+                        self.assertEqual(stored["kind"], "gotcha")
+                        self.assertTrue(os.path.exists(db))
+
+                        # recall by query (FTS path over the wire)
+                        res = await session.call_tool(
+                            "recall_facts", {"project": "e2e", "query": "offline"})
+                        recalled = json.loads(res.content[0].text)["facts"]
+                        self.assertEqual([f["id"] for f in recalled], [stored["id"]])
+
+                        # full record by id + supersede
+                        res = await session.call_tool(
+                            "store_fact",
+                            {"project": "e2e", "fact": "the build is offline (corrected)",
+                             "supersedes": stored["id"]},
+                        )
+                        new_id = json.loads(res.content[0].text)["id"]
+                        res = await session.call_tool(
+                            "recall_facts", {"project": "e2e", "id": stored["id"]})
+                        self.assertTrue(res.content[0].text.startswith("error:"))
+
+                        # archive + scour
+                        res = await session.call_tool("archive_fact", {"id": new_id})
+                        archived = json.loads(res.content[0].text)
+                        self.assertIsNotNone(archived["archived_at"])
+                        res = await session.call_tool(
+                            "scour_archives", {"project": "e2e"})
+                        scoured = json.loads(res.content[0].text)["facts"]
+                        # the superseded fact and the archived one, most recent first
+                        self.assertEqual(
+                            [f["id"] for f in scoured], [new_id, stored["id"]])
+
+                        # list_projects aggregates
+                        res = await session.call_tool("list_projects", {})
+                        projects = json.loads(res.content[0].text)["projects"]
+                        self.assertEqual(projects[0]["project"], "e2e")
+                        self.assertEqual(
+                            (projects[0]["active"], projects[0]["archived"]), (0, 2))
+                        self.assertEqual(projects[0]["top_tags"], ["build"])
+
+            self._run(lifecycle())
+
+    def test_garbage_args_fail_tool_call_not_server_over_stdio(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env = dict(os.environ, STORE_N_RECALL_DB=os.path.join(tmp, "f.db"),
+                       STORE_N_RECALL_PROJECT="p")
+            async def run():
+                params = StdioServerParameters(
+                    command=sys.executable, args=["-m", "store_n_recall"], env=env)
+                async with stdio_client(params) as (r, w):
+                    async with ClientSession(r, w) as session:
+                        await session.initialize()
+                        res = await session.call_tool(
+                            "store_fact", {"fact": "x", "tags": "not-a-list"})
+                        self.assertTrue(res.is_error)
+                        self.assertIn("tags", res.content[0].text)
+                        # server still alive and serving afterwards
+                        res = await session.call_tool(
+                            "store_fact", {"fact": "still works"})
+                        self.assertFalse(res.is_error)
+            self._run(run())
 
 
 if __name__ == "__main__":

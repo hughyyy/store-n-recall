@@ -44,6 +44,29 @@ class InitTests(StoreTestCase):
         store.store_fact("p", "hello")
         self.assertTrue(os.path.exists(db))
 
+    def test_bare_relative_path_without_parent_dir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = os.getcwd()
+            os.chdir(tmp)
+            try:
+                store = Store("plain.db")
+                store.store_fact("p", "x")
+                self.assertTrue(os.path.exists("plain.db"))
+                self.assertEqual(len(store.recall_facts("p")), 1)
+            finally:
+                os.chdir(cwd)
+
+    def test_fts_probe_falls_back_when_fts5_missing(self):
+        import sqlite3
+        from unittest import mock
+        from store_n_recall.store import _fts_available
+
+        def boom(*args, **kwargs):
+            raise sqlite3.OperationalError("no such module: fts5")
+
+        with mock.patch("store_n_recall.store.sqlite3.connect", side_effect=boom):
+            self.assertFalse(_fts_available())
+
     def test_empty_store_recall_scour_list(self):
         self.assertEqual(self.store.recall_facts("p"), [])
         self.assertEqual(self.store.scour_archives("p"), [])
@@ -428,6 +451,22 @@ class QueryFtsTests(StoreTestCase):
         self.assertEqual(len(got), 1)
         self.assertEqual(got[0]["tags"], ["build", "repo"])
 
+    def test_unicode_words_searchable(self):
+        self.store.store_fact("p", "Привет мир, сборка готова")
+        self.assertEqual(len(self.store.recall_facts("p", query="сборка")), 1)
+        self.assertEqual(len(self.store.recall_facts("p", query="мир")), 1)
+        # multi-word query is an implicit AND over tokens
+        self.assertEqual(len(self.store.recall_facts("p", query="сборка мир")), 1)
+        self.assertEqual(self.store.recall_facts("p", query="сборка отсутствует"), [])
+
+    def test_emoji_has_no_word_tokens(self):
+        self.store.store_fact("p", "docker deploy 🐳 everywhere")
+        self.assertEqual(len(self.store.recall_facts("p", query="docker")), 1)
+        # punctuation/emoji-only query matches nothing, per the token rule
+        self.assertEqual(self.store.recall_facts("p", query="🐳"), [])
+        # words in a mixed query still count; the emoji token is dropped
+        self.assertEqual(len(self.store.recall_facts("p", query="docker 🐳")), 1)
+
 
 class QueryLikeFallbackTests(StoreTestCase):
     """Explicitly exercise the no-FTS path (Store(use_fts=False))."""
@@ -472,6 +511,22 @@ class QueryLikeFallbackTests(StoreTestCase):
             len(self.like.recall_facts("p", query="needle", kind="gotcha", tags=["repo"], min_confidence=0.5)),
             2,
         )
+
+    def test_like_fallback_unicode_exact_match(self):
+        self.like.store_fact("p", "déjà vu 日本語")
+        self.assertEqual(len(self.like.recall_facts("p", query="日本語")), 1)
+        self.assertEqual(len(self.like.recall_facts("p", query="déjà")), 1)
+
+    def test_scour_query_with_like_orders_most_recently_archived_first(self):
+        a = self.like.store_fact("p", "retired needle")["id"]
+        b = self.like.store_fact("p", "another retired needle")["id"]
+        self.like.archive_fact(a)
+        self.like.archive_fact(b)
+        got = self.like.scour_archives("p", query="needle")
+        self.assertEqual([f["id"] for f in got], [b, a])
+        self.assertEqual(
+            [f["id"] for f in self.like.scour_archives("p", query="needle", fact_id=b)],
+            [b])
 
 
 class ArchiveTests(StoreTestCase):

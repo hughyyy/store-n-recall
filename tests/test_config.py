@@ -56,6 +56,14 @@ class LoadConfigTests(unittest.TestCase):
             cfg = load_config()
         self.assertTrue(cfg.db_path.endswith("store-n-recall/facts.db"))
 
+    def test_no_data_directory_raises_clear_error(self):
+        env = dict(CLEAN_ENV, STORE_N_RECALL_DB="", XDG_DATA_HOME="")
+        with mock.patch.dict(os.environ, env, clear=True), \
+                mock.patch("os.path.expanduser", return_value=""):
+            with self.assertRaises(FactError) as cm:
+                load_config()
+        self.assertIn("STORE_N_RECALL_DB", str(cm.exception))
+
     def test_project_env_default(self):
         env = dict(CLEAN_ENV, STORE_N_RECALL_PROJECT="  my-proj  ")
         with mock.patch.dict(os.environ, env, clear=True):
