@@ -249,9 +249,7 @@ class Store:
 
     # -- fact records -------------------------------------------------------
 
-    def _record(
-        self, row: sqlite3.Row, conn: sqlite3.Connection, *, with_sources: bool
-    ) -> dict[str, Any]:
+    def _record(self, row: sqlite3.Row, conn: sqlite3.Connection) -> dict[str, Any]:
         record: dict[str, Any] = {}
         for key in _ROW_KEYS:
             value = row[key]
@@ -260,12 +258,11 @@ class Store:
             if key == "archived_at" and value is None:
                 continue  # present once archived, per the fact model
             record[key] = value
-        if with_sources:
-            record["sources"] = [dict(s) for s in self._sources(conn, row["id"])]
-            for entry in record["sources"]:
-                for k in ("session", "note", "pointer"):
-                    if entry[k] is None:
-                        del entry[k]
+        record["sources"] = [dict(s) for s in self._sources(conn, row["id"])]
+        for entry in record["sources"]:
+            for k in ("session", "note", "pointer"):
+                if entry[k] is None:
+                    del entry[k]
         return record
 
     def _sources(self, conn: sqlite3.Connection, fact_id: int) -> sqlite3.Cursor:
@@ -353,7 +350,7 @@ class Store:
             ).fetchone()
             if row is None:
                 raise FactError(f"no fact with id {fact_id}")
-            return self._record(row, conn, with_sources=True)
+            return self._record(row, conn)
 
     # -- recall / scour -----------------------------------------------------
 
@@ -529,7 +526,7 @@ class Store:
             row = conn.execute(
                 f"SELECT {_RECALL_COLUMNS} FROM facts WHERE id = ?", (fact_id,)
             ).fetchone()
-            return self._record(row, conn, with_sources=True)
+            return self._record(row, conn)
 
     # -- listing ------------------------------------------------------------
 

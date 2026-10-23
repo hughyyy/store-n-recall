@@ -46,15 +46,11 @@ def _call(fn) -> str:
 
 def _recall_by_id(store: Store, project: str, fact_id: int, archived: bool) -> str:
     """id= lookup: full record, but the recall path must stay blind to
-    archived facts and the scour path to active ones (Store.enforce)."""
+    archived facts and the scour path to active ones (Store enforces)."""
     if archived:
-        probe = store.scour_archives(project, fact_id=fact_id, limit=1)
+        store.scour_archives(project, fact_id=fact_id, limit=1)
     else:
-        probe = store.recall_facts(project, fact_id=fact_id, limit=1)
-    if not probe:
-        raise FactError(
-            f"no {'archived' if archived else 'active'} fact with id {fact_id}"
-        )
+        store.recall_facts(project, fact_id=fact_id, limit=1)
     return {"fact": store.get_fact(fact_id)}
 
 
@@ -68,8 +64,8 @@ def create_server(
 
     @mcp.tool()
     def store_fact(
+        fact: str,
         project: str | None = None,
-        fact: str | None = None,
         kind: str | None = None,
         tags: list[str] | None = None,
         confidence: float | None = None,
@@ -83,8 +79,7 @@ def create_server(
         agent, session = _identity(ctx)
         return _call(
             lambda: store.store_fact(
-                cfg.resolve_project(project),
-                fact,  # type: ignore[arg-type]  # validated in the store
+                cfg.resolve_project(project), fact,
                 kind=kind,
                 tags=tags,
                 confidence=confidence,
