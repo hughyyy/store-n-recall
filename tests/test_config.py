@@ -76,6 +76,11 @@ class LoadConfigTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True):
             self.assertEqual(load_config().agent, "builder")
 
+    def test_agent_env_whitespace_falls_back(self):
+        env = dict(CLEAN_ENV, STORE_N_RECALL_AGENT="   ")
+        with mock.patch.dict(os.environ, env, clear=True):
+            self.assertEqual(load_config().agent, "unknown")
+
 
 class ResolveProjectTests(unittest.TestCase):
     """Param wins > env fallback > clear error. No cwd-derived default exists

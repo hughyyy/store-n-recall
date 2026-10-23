@@ -80,7 +80,10 @@ tests/
   `archived_at DESC, id DESC` (most recently archived first).
 - `limit` default 50, must be a positive int; applied after tag filtering.
 - `id`/`supersedes` accept int (or digit strings from untyped callers),
-  positive only.
+  positive only, bools rejected.
+- `archive_fact(id=)` on an active fact is an error; `scour_archives(id=)` on a
+  non-archived fact is an error — id lookups fail loudly on the wrong side of
+  the archive flag (filters may still narrow a correctly-sided id to empty).
 - Input normalization: project/kind/text/tags/query stripped; kind lowercased
   and validated against the closed taxonomy; tags deduped + sorted; confidence
   coerced to float and bounds-checked (NaN/inf rejected, boundaries

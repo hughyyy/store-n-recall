@@ -94,7 +94,14 @@ def _text(value: str) -> str:
 
 
 def _kind(value: str | None) -> str:
-    kind = (value or "fact").strip().lower()
+    if not isinstance(value, str):
+        if value is None:
+            value = "fact"
+        else:
+            raise FactError(
+                f"unknown kind {value!r}: choose one of {', '.join(KINDS)}"
+            )
+    kind = value.strip().lower()
     if kind not in KINDS:
         raise FactError(
             f"unknown kind {value!r}: choose one of {', '.join(KINDS)}"
@@ -122,6 +129,8 @@ def _tags(value: Sequence[str] | None) -> list[str]:
 def _confidence(value: float | int | str | None, default: float = DEFAULT_CONFIDENCE) -> float:
     if value is None:
         return default
+    if isinstance(value, bool):
+        raise FactError(f"confidence must be a number between 0.0 and 1.0, got {value!r}")
     try:
         num = float(value)
     except (TypeError, ValueError):
@@ -134,10 +143,12 @@ def _confidence(value: float | int | str | None, default: float = DEFAULT_CONFID
 
 
 def _fact_id(value: int | str | None) -> int:
+    if isinstance(value, bool):
+        raise FactError(f"id must be a positive integer, got {value!r}")
     try:
         fid = int(value)
     except (TypeError, ValueError):
-        raise FactError(f"id must be an integer, got {value!r}")
+        raise FactError(f"id must be a positive integer, got {value!r}")
     if fid < 1:
         raise FactError(f"id must be a positive integer, got {value!r}")
     return fid
@@ -406,6 +417,13 @@ class Store:
         facts = self._select(project, kind=kind, min_confidence=min_confidence,
                              active=False, fact_id=fact_id, query=query)
         facts = [f for f in facts if set(f["tags"]) >= set(tags)]
+        if fact_id is not None:
+            # `id` pins the record: filters may narrow it, but a target that is
+            # not archived here is an error, not an empty list.
+            probe = self._select(project, kind=None, min_confidence=None,
+                                 active=False, fact_id=fact_id, query=None)
+            if not probe:
+                raise FactError(f"no archived fact with id {fact_id}")
         if query is not None and not self.fts:
             facts = sorted(facts, key=lambda r: (r["archived_at"], r["id"]), reverse=True)
         return facts[:limit]

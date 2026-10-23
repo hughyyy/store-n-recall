@@ -29,6 +29,20 @@ def _worker_store(db_path: str, worker_id: int, count: int) -> int:
     return len(store.recall_facts(f"proj-{worker_id}"))
 
 
+def _worker_contend(db_path: str, op: str, target_id: int) -> str:
+    """Race to retire `target_id`; exactly one caller may win."""
+    from store_n_recall.config import FactError
+    store = Store(db_path)
+    try:
+        if op == "supersede":
+            store.store_fact("proj", "replacement fact", supersedes=target_id)
+        else:
+            store.archive_fact(target_id)
+        return "won"
+    except FactError:
+        return "lost"
+
+
 class ConcurrentWritersTests(unittest.TestCase):
     def test_many_writers_one_file_no_loss_no_corruption(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -63,6 +77,44 @@ class ConcurrentWritersTests(unittest.TestCase):
             reader.recall_facts("p")
             writer.store_fact("p", "second")
             self.assertEqual(len(reader.recall_facts("p")), 2)
+
+    def test_concurrent_supersedes_have_exactly_one_winner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "facts.db")
+            target = Store(db).store_fact("proj", "stale claim")["id"]
+            ctx = multiprocessing.get_context("spawn")
+            with ctx.Pool(8) as pool:
+                results = pool.starmap(
+                    _worker_contend, [(db, "supersede", target)] * 8
+                )
+            self.assertEqual(results.count("won"), 1)
+            self.assertEqual(results.count("lost"), 7)
+            checker = Store(db)
+            record = checker.get_fact(target)
+            # archived exactly once: one archived provenance event, no repeats
+            self.assertEqual(
+                [s["action"] for s in record["sources"]], ["stored", "archived"]
+            )
+            replacements = checker.recall_facts("proj")
+            self.assertEqual(len(replacements), 1)  # losers stored nothing
+
+    def test_concurrent_archives_have_exactly_one_winner(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = os.path.join(tmp, "facts.db")
+            target = Store(db).store_fact("proj", "doomed fact")["id"]
+            ctx = multiprocessing.get_context("spawn")
+            with ctx.Pool(8) as pool:
+                results = pool.starmap(
+                    _worker_contend, [(db, "archive", target)] * 8
+                )
+            self.assertEqual(results.count("won"), 1)
+            self.assertEqual(results.count("lost"), 7)
+            checker = Store(db)
+            record = checker.get_fact(target)
+            self.assertEqual(
+                [s["action"] for s in record["sources"]], ["stored", "archived"]
+            )
+            self.assertEqual(checker.recall_facts("proj"), [])
 
 
 if __name__ == "__main__":

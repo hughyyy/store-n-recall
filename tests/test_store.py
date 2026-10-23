@@ -172,6 +172,32 @@ class StoreFactTests(StoreTestCase):
         for bad in (None, "", "   "):
             with self.assertRaises(FactError, msg=repr(bad)):
                 self.store.store_fact(bad, "x")
+        for bad in (None, "", "   "):
+            with self.assertRaises(FactError, msg=repr(bad)):
+                self.store.recall_facts(bad)
+            with self.assertRaises(FactError, msg=repr(bad)):
+                self.store.scour_archives(bad)
+
+    def test_query_must_be_string(self):
+        self.store.store_fact("p", "x")
+        for bad in (5, ["needle"], {"text": "needle"}):
+            with self.assertRaises(FactError, msg=repr(bad)):
+                self.store.recall_facts("p", query=bad)
+            with self.assertRaises(FactError, msg=repr(bad)):
+                self.store.scour_archives("p", query=bad)
+
+    def test_get_fact_unknown_id(self):
+        with self.assertRaises(FactError) as cm:
+            self.store.get_fact(999)
+        self.assertIn("no fact with id 999", str(cm.exception))
+
+    def test_identical_facts_are_distinct_rows(self):
+        # No dedup: facts are immutable records; corrections go through
+        # supersede, so storing the same text twice is two independent facts.
+        a = self.store.store_fact("p", "same words")["id"]
+        b = self.store.store_fact("p", "same words")["id"]
+        self.assertNotEqual(a, b)
+        self.assertEqual([f["id"] for f in self.store.recall_facts("p")], [b, a])
 
     def test_kind_closed_taxonomy(self):
         for kind in (None, "fact", "decision", "gotcha", "convention", "FACT", " Decision "):
@@ -179,11 +205,15 @@ class StoreFactTests(StoreTestCase):
         for bad in ("note", "memory", "fact,gotcha"):
             with self.assertRaises(FactError, msg=repr(bad)):
                 self.store.store_fact("p", "x", kind=bad)
+        # non-string kinds are an error, not a crash
+        for bad in (5, ["fact"], {"kind": "fact"}, 3.5):
+            with self.assertRaises(FactError, msg=repr(bad)):
+                self.store.store_fact("p", "x", kind=bad)
 
     def test_confidence_bounds(self):
         self.store.store_fact("p", "x", confidence=0.0)
         self.store.store_fact("p", "x", confidence=1.0)
-        for bad in (-0.1, 1.01, float("nan"), float("inf"), float("-inf"), "abc", "1.0x"):
+        for bad in (-0.1, 1.01, float("nan"), float("inf"), float("-inf"), "abc", "1.0x", True, False):
             with self.assertRaises(FactError, msg=repr(bad)):
                 self.store.store_fact("p", "x", confidence=bad)
 
@@ -384,6 +414,20 @@ class QueryFtsTests(StoreTestCase):
         got = self.store.recall_facts("p", query="terms")
         self.assertEqual(len(got), 2)
 
+    def test_query_composes_with_kind_tags_and_confidence(self):
+        self.store.store_fact(
+            "p", "needle in the build docs", kind="gotcha", tags=["repo", "build"], confidence=0.9)
+        self.store.store_fact(
+            "p", "needle in the build docs", kind="fact", tags=["repo", "build"], confidence=0.9)
+        self.store.store_fact(
+            "p", "needle in the build docs", kind="gotcha", tags=["repo"], confidence=0.9)
+        self.store.store_fact(
+            "p", "needle in the build docs", kind="gotcha", tags=["repo", "build"], confidence=0.4)
+        got = self.store.recall_facts(
+            "p", query="needle", kind="gotcha", tags=["repo", "build"], min_confidence=0.5)
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["tags"], ["build", "repo"])
+
 
 class QueryLikeFallbackTests(StoreTestCase):
     """Explicitly exercise the no-FTS path (Store(use_fts=False))."""
@@ -455,9 +499,19 @@ class ArchiveTests(StoreTestCase):
         self.assertIn("already archived", str(cm.exception))
 
     def test_archive_id_validation(self):
-        for bad in (0, -3, "x", None, 1.5):
+        for bad in (0, -3, "x", None, 1.5, True):
             with self.assertRaises(FactError, msg=repr(bad)):
                 self.store.archive_fact(bad)
+
+    def test_recall_id_validation(self):
+        for bad in (0, -3, "x", 1.5, True):
+            with self.assertRaises(FactError, msg=repr(bad)):
+                self.store.recall_facts("p", fact_id=bad)
+
+    def test_supersedes_id_validation(self):
+        for bad in (0, -3, "x", 1.5, True):
+            with self.assertRaises(FactError, msg=repr(bad)):
+                self.store.store_fact("p", "x", supersedes=bad)
 
     def test_archive_note_validation(self):
         fact_id = self.store.store_fact("p", "note me")["id"]
@@ -521,7 +575,20 @@ class ScourTests(StoreTestCase):
 
     def test_scour_by_id_active_fact_fails(self):
         fid = self.store.store_fact("p", "still active")["id"]
-        self.assertEqual(self.store.scour_archives("p", fact_id=fid), [])
+        with self.assertRaises(FactError) as cm:
+            self.store.scour_archives("p", fact_id=fid)
+        self.assertIn("no archived fact with id", str(cm.exception))
+
+    def test_scour_by_id_unknown(self):
+        with self.assertRaises(FactError) as cm:
+            self.store.scour_archives("p", fact_id=999)
+        self.assertIn("no archived fact with id 999", str(cm.exception))
+
+    def test_scour_by_id_filters_may_narrow(self):
+        fid = self.store.store_fact("p", "archived gotcha", kind="gotcha")["id"]
+        self.store.archive_fact(fid)
+        self.assertEqual(len(self.store.scour_archives("p", fact_id=fid, kind="gotcha")), 1)
+        self.assertEqual(self.store.scour_archives("p", fact_id=fid, kind="fact"), [])
 
 
 class SupersedeTests(StoreTestCase):

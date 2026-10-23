@@ -150,9 +150,44 @@ class ValidationViaMcpTests(ServerTestCase):
             ("archive_fact", {"id": 4242}),
             ("recall_facts", {"project": "p", "limit": 0}),
             ("recall_facts", {"project": "p", "kind": "bogus"}),
+            ("recall_facts", {"project": "p", "id": 0}),
+            ("scour_archives", {"project": "p", "id": -1}),
+            # NOTE: confidence=True is not here — the SDK coerces bool to
+            # 1.0 at the schema layer before the store sees it; the store's
+            # bool rejection is the direct-API contract (test_store).
+            ("store_fact", {"project": "p", "fact": "x", "supersedes": True}),
+            ("archive_fact", {"id": True}),
         ):
             text = call_raw(self.mcp, name, args)
             self.assertTrue(text.startswith("error:"), f"{name}{args} -> {text}")
+
+    def test_schema_mismatches_fail_tool_call_not_server(self):
+        # Garbage shapes fail pydantic validation at the SDK layer; the server
+        # must report a tool error, never crash the process.
+        from mcp.server.mcpserver.exceptions import ToolError
+        for name, args in (
+            ("store_fact", {"project": "p", "fact": "x", "tags": "repo"}),
+            ("store_fact", {"project": "p", "fact": "x", "kind": 5}),
+            ("store_fact", {"project": "p", "fact": 42}),
+            ("recall_facts", {"project": "p", "limit": 1.5}),
+            ("recall_facts", {"project": "p", "min_confidence": {"x": 1}}),
+            ("archive_fact", {"id": "not-a-number"}),
+        ):
+            with self.assertRaises(ToolError, msg=f"{name}{args}"):
+                asyncio.run(self.mcp.call_tool(name, args))
+
+    def test_digit_strings_coerce_to_numbers(self):
+        fact = call(
+            self.mcp, "store_fact",
+            {"project": "p", "fact": "x", "confidence": "0.8", "kind": "gotcha"},
+        )
+        self.assertEqual(fact["confidence"], 0.8)
+        self.assertEqual(fact["kind"], "gotcha")
+        fid = fact["id"]
+        call(self.mcp, "store_fact", {"project": "p", "fact": "replacement", "supersedes": str(fid)})
+        self.assertIsNotNone(
+            call(self.mcp, "scour_archives", {"project": "p", "id": str(fid)})["fact"]["archived_at"]
+        )
 
     def test_supersede_cross_project_via_mcp(self):
         old = call(self.mcp, "store_fact", {"project": "a", "fact": "x"})
@@ -212,6 +247,16 @@ class IdentityTests(unittest.TestCase):
         from store_n_recall.server import _identity
         ctx = _FakeCtx(_FakeSession(client_info=_FakeClientInfo("agent-7")))
         self.assertEqual(_identity(ctx), ("agent-7", None))
+
+    def test_session_id_extracted_when_transport_has_one(self):
+        from store_n_recall.server import _identity
+        ctx = _FakeCtx(_FakeSession(client_info=_FakeClientInfo("agent-7"), session_id="sess-abc"))
+        self.assertEqual(_identity(ctx), ("agent-7", "sess-abc"))
+
+    def test_session_id_without_client_info(self):
+        from store_n_recall.server import _identity
+        ctx = _FakeCtx(_FakeSession(client_info=None, session_id="sess-abc"))
+        self.assertEqual(_identity(ctx), (None, "sess-abc"))
 
     def test_missing_client_info_degrades_to_none(self):
         from store_n_recall.server import _identity
