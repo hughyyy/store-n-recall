@@ -4,11 +4,23 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "store-n-recall"
-version = "0.1.0"
+dynamic = ["version"]
 description = "MCP server giving agents a persistent knowledgebase: store and recall facts about projects"
+readme = "README.md"
 requires-python = ">=3.10"
+keywords = ["mcp", "agents", "knowledgebase", "sqlite", "memory"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries",
+]
 dependencies = [
-    "mcp>=2",
+    # Upper-bounded: the server is built against the mcp 2.x MCPServer API.
+    "mcp>=2,<3",
 ]
 
 [project.scripts]
@@ -16,3 +28,9 @@ store-n-recall = "store_n_recall.server:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "store_n_recall.__version__"}
+
+[tool.setuptools.package-data]
+store_n_recall = ["py.typed"]
