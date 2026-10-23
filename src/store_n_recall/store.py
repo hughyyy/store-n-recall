@@ -28,7 +28,14 @@ KINDS = ("fact", "decision", "gotcha", "convention")
 DEFAULT_CONFIDENCE = 0.5
 DEFAULT_LIMIT = 50
 BUSY_TIMEOUT_MS = 5000
+# SQLite stores INTEGER as signed 64-bit; larger ids raise OverflowError from
+# the driver, so they are rejected as FactErrors before binding.
+MAX_FACT_ID = 2**63 - 1
+# Facts are short, durable statements, not transcript dumps. A cap keeps a
+# runaway agent from bloating the store and its full-text index.
+MAX_FACT_CHARS = 16_384
 TOP_TAGS_LIMIT = 5
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS facts (
@@ -39,7 +46,8 @@ CREATE TABLE IF NOT EXISTS facts (
     tags        TEXT    NOT NULL,  -- JSON array, sorted + deduped
     confidence  REAL    NOT NULL,
     created_at  TEXT    NOT NULL,  -- ISO-8601 UTC
-    archived_at TEXT              -- NULL while active
+    archived_at TEXT,              -- NULL while active
+    supersedes  INTEGER REFERENCES facts(id)
 );
 CREATE INDEX IF NOT EXISTS idx_facts_scope
     ON facts(project, archived_at, created_at DESC);
@@ -56,19 +64,44 @@ CREATE TABLE IF NOT EXISTS sources (
 CREATE INDEX IF NOT EXISTS idx_sources_fact ON sources(fact_id);
 """
 
-_FTS_SCHEMA = """
-CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts
-    USING fts5(text, content='facts', content_rowid='id');
-CREATE TRIGGER IF NOT EXISTS facts_fts_insert AFTER INSERT ON facts BEGIN
-    INSERT INTO facts_fts(rowid, text) VALUES (new.id, new.text);
-END;
+# The invariants above are enforced by the database too, so a future code path
+# (or an external writer) cannot delete a fact, rewrite its content, or rewrite
+# provenance. Only `archived_at` may ever be updated.
+_KINDS_SQL = ", ".join(f"'{kind}'" for kind in KINDS)
+_GUARDS = f"""
+CREATE TRIGGER IF NOT EXISTS facts_no_delete BEFORE DELETE ON facts
+BEGIN SELECT RAISE(ABORT, 'facts are archived, never deleted'); END;
+CREATE TRIGGER IF NOT EXISTS facts_content_immutable
+BEFORE UPDATE OF project, kind, text, tags, confidence, created_at, supersedes ON facts
+BEGIN SELECT RAISE(ABORT, 'fact content is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS facts_insert_guard BEFORE INSERT ON facts
+WHEN NEW.kind NOT IN ({_KINDS_SQL})
+  OR NEW.confidence < 0.0 OR NEW.confidence > 1.0
+BEGIN SELECT RAISE(ABORT, 'invalid kind or confidence'); END;
+CREATE TRIGGER IF NOT EXISTS sources_no_update BEFORE UPDATE ON sources
+BEGIN SELECT RAISE(ABORT, 'sources are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS sources_no_delete BEFORE DELETE ON sources
+BEGIN SELECT RAISE(ABORT, 'sources are append-only'); END;
+CREATE TRIGGER IF NOT EXISTS sources_insert_guard BEFORE INSERT ON sources
+WHEN NEW.action NOT IN ('stored', 'archived')
+BEGIN SELECT RAISE(ABORT, 'invalid source action'); END;
 """
+
+_FTS_TABLE = (
+    "CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts"
+    " USING fts5(text, content='facts', content_rowid='id')"
+)
+_FTS_TRIGGER = (
+    "CREATE TRIGGER IF NOT EXISTS facts_fts_insert AFTER INSERT ON facts BEGIN"
+    " INSERT INTO facts_fts(rowid, text) VALUES (new.id, new.text); END"
+)
 
 _RECALL_COLUMNS = (
     "facts.id, facts.project, facts.kind, facts.text, facts.tags,"
-    " facts.confidence, facts.created_at, facts.archived_at"
+    " facts.confidence, facts.created_at, facts.archived_at, facts.supersedes"
 )
-_ROW_KEYS = ("id", "project", "kind", "text", "tags", "confidence", "created_at", "archived_at")
+_ROW_KEYS = ("id", "project", "kind", "text", "tags", "confidence",
+             "created_at", "supersedes", "archived_at")
 
 
 def utc_now() -> str:
@@ -90,7 +123,13 @@ def _project(value: str | None) -> str:
 def _text(value: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise FactError("fact is required and must be a non-empty string")
-    return value.strip()
+    text = value.strip()
+    if len(text) > MAX_FACT_CHARS:
+        raise FactError(
+            f"fact is too long: {len(text)} characters (maximum {MAX_FACT_CHARS});"
+            " store one self-contained statement, not a transcript"
+        )
+    return text
 
 
 def _kind(value: str | None) -> str:
@@ -112,7 +151,7 @@ def _kind(value: str | None) -> str:
 def _tags(value: Sequence[str] | None) -> list[str]:
     if value is None:
         return []
-    if isinstance(value, str):
+    if isinstance(value, str) or not isinstance(value, (list, tuple)):
         raise FactError("tags must be a list of strings")
     out: list[str] = []
     for tag in value:
@@ -133,7 +172,7 @@ def _confidence(value: float | int | str | None, default: float = DEFAULT_CONFID
         raise FactError(f"confidence must be a number between 0.0 and 1.0, got {value!r}")
     try:
         num = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         raise FactError(f"confidence must be a number between 0.0 and 1.0, got {value!r}")
     if num != num or num in (float("inf"), float("-inf")):
         raise FactError(f"confidence must be a number between 0.0 and 1.0, got {value!r}")
@@ -143,15 +182,58 @@ def _confidence(value: float | int | str | None, default: float = DEFAULT_CONFID
 
 
 def _fact_id(value: int | str | None) -> int:
+    """Positive int id from an int, an integral float/Decimal, or a digit string.
+
+    Non-integral numbers are rejected rather than truncated: `int(1.9)` is 1,
+    which would silently address a different fact than the caller named.
+    """
     if isinstance(value, bool):
         raise FactError(f"id must be a positive integer, got {value!r}")
     try:
         fid = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        raise FactError(f"id must be a positive integer, got {value!r}")
+    # Strings are compared by their integer value; numeric types must be
+    # exactly integral (float, Decimal, Fraction all truncate under int()).
+    if not isinstance(value, str) and value != fid:
         raise FactError(f"id must be a positive integer, got {value!r}")
     if fid < 1:
         raise FactError(f"id must be a positive integer, got {value!r}")
+    if fid > MAX_FACT_ID:
+        raise FactError(f"id {value!r} is out of range: ids are 1..{MAX_FACT_ID}")
     return fid
+
+
+def _source(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise FactError("source must be a non-empty string")
+    return value.strip()
+
+
+def _note(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise FactError("note must be a non-empty string")
+    return value.strip()
+
+
+def _agent(value: str | None, default: str) -> str:
+    if value is None:
+        return default
+    if not isinstance(value, str):
+        raise FactError(f"agent must be a string, got {value!r}")
+    return value.strip() or default
+
+
+def _session(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise FactError(f"session must be a string, got {value!r}")
+    return value.strip() or None
 
 
 def _limit(value: int | None) -> int:
@@ -207,11 +289,13 @@ class Store:
         self.path = os.fspath(path)
         self.default_agent = default_agent
         self.fts = use_fts and _fts_available()
+        # Schema setup (DDL, migration, guards, mirror) runs on the first
+        # connection and is then cached: it is idempotent, but repeating the
+        # DDL on every operation costs a write transaction for nothing.
+        self._initialized = False
         # Deliberately touch nothing on disk here: the store file is created on
         # demand at the first connection, so a server can start and register
         # tools with no store file present.
-
-    # -- lifecycle ----------------------------------------------------------
 
     @contextmanager
     def _conn(self) -> Iterator[sqlite3.Connection]:
@@ -222,14 +306,16 @@ class Store:
         try:
             conn.row_factory = sqlite3.Row
             conn.execute("PRAGMA journal_mode=WAL")
-            conn.execute("PRAGMA busy_timeout=5000")
+            conn.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA foreign_keys=ON")
-            # Idempotent and race-safe (IF NOT EXISTS): concurrent first-use by
-            # several processes serializes on the SQLite lock.
-            conn.executescript(_SCHEMA)
-            if self.fts:
-                conn.executescript(_FTS_SCHEMA)
+            if not self._initialized:
+                # Idempotent and race-safe (IF NOT EXISTS): concurrent first-use
+                # by several processes serializes on the SQLite lock.
+                _init_schema(conn)
+                if self.fts:
+                    self._setup_fts(conn)
+                self._initialized = True
             yield conn
         finally:
             conn.close()
@@ -247,6 +333,36 @@ class Store:
                 conn.execute("ROLLBACK")
                 raise
 
+    def _setup_fts(self, conn: sqlite3.Connection) -> None:
+        """Create the FTS mirror and backfill it when the index is incomplete.
+
+        Facts stored while FTS5 was unavailable (LIKE fallback), by an older
+        build, or by a build whose setup created the trigger without a backfill
+        are absent from the index and the insert-only trigger cannot fill them
+        in. Creation, trigger, and rebuild therefore run in **one write
+        transaction**: a concurrent opener either sees the finished mirror or
+        waits and finds it ready. A mirror that cannot be rebuilt at all (for
+        example a missing shadow table) is dropped and recreated rather than
+        leaving the store permanently unusable.
+        """
+        if _fts_ready(conn):
+            return
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if _fts_doc_count(conn) is None:
+                # Unusable mirror (missing shadow table): drop and rebuild it;
+                # CREATE IF NOT EXISTS alone would keep the broken table.
+                conn.execute("DROP TABLE IF EXISTS facts_fts")
+            conn.execute(_FTS_TABLE)
+            conn.execute(_FTS_TRIGGER)
+            has_facts = conn.execute("SELECT 1 FROM facts LIMIT 1").fetchone() is not None
+            if has_facts:
+                conn.execute("INSERT INTO facts_fts(facts_fts) VALUES('rebuild')")
+            conn.commit()
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+
     # -- fact records -------------------------------------------------------
 
     def _record(self, row: sqlite3.Row, conn: sqlite3.Connection) -> dict[str, Any]:
@@ -255,8 +371,8 @@ class Store:
             value = row[key]
             if key == "tags":
                 value = json.loads(value)
-            if key == "archived_at" and value is None:
-                continue  # present once archived, per the fact model
+            if value is None:
+                continue  # archived_at once archived, supersedes once used
             record[key] = value
         record["sources"] = [dict(s) for s in self._sources(conn, row["id"])]
         for entry in record["sources"]:
@@ -287,22 +403,23 @@ class Store:
         agent: str | None = None,
         session: str | None = None,
     ) -> dict[str, Any]:
-        """Store one fact; with `supersedes`, archive the old fact in the same act."""
-        if source is not None and (not isinstance(source, str) or not source.strip()):
-            raise FactError("source must be a non-empty string")
+        """Store one fact; with `supersedes`, archive the old fact in the same
+        act and record the link in both provenance trails."""
         project = _project(project)
         text = _text(fact)
         kind = _kind(kind)
         tags = _tags(tags)
         confidence = _confidence(confidence)
-        agent = agent or self.default_agent
-        now = utc_now()
+        source = _source(source)
+        agent = _agent(agent, self.default_agent)
+        session = _session(session)
 
         target_id: int | None = None
         if supersedes is not None:
             target_id = _fact_id(supersedes)
 
         with self._write() as conn:
+            now = utc_now()
             if target_id is not None:
                 old = conn.execute(
                     "SELECT id, project, archived_at FROM facts WHERE id = ?",
@@ -319,15 +436,17 @@ class Store:
                     )
 
             cur = conn.execute(
-                "INSERT INTO facts (project, kind, text, tags, confidence, created_at)"
-                " VALUES (?, ?, ?, ?, ?, ?)",
-                (project, kind, text, json.dumps(tags), confidence, now),
+                "INSERT INTO facts"
+                " (project, kind, text, tags, confidence, created_at, supersedes)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (project, kind, text, json.dumps(tags), confidence, now, target_id),
             )
             new_id = cur.lastrowid
+            note = f"supersedes fact {target_id}" if target_id is not None else None
             conn.execute(
                 "INSERT INTO sources (fact_id, action, agent, session, at, note, pointer)"
-                " VALUES (?, 'stored', ?, ?, ?, NULL, ?)",
-                (new_id, agent, session, now, source),
+                " VALUES (?, 'stored', ?, ?, ?, ?, ?)",
+                (new_id, agent, session, now, note, source),
             )
             if target_id is not None:
                 conn.execute(
@@ -336,14 +455,17 @@ class Store:
                 )
                 conn.execute(
                     "INSERT INTO sources (fact_id, action, agent, session, at, note, pointer)"
-                    " VALUES (?, 'archived', ?, ?, ?, NULL, NULL)",
-                    (target_id, agent, session, now),
+                    " VALUES (?, 'archived', ?, ?, ?, ?, NULL)",
+                    (target_id, agent, session, now, f"superseded by fact {new_id}"),
                 )
+            row = conn.execute(
+                f"SELECT {_RECALL_COLUMNS} FROM facts WHERE id = ?", (new_id,)
+            ).fetchone()
+            return self._record(row, conn)
 
-        return self.get_fact(new_id)
-
-    def get_fact(self, fact_id: int) -> dict[str, Any]:
+    def get_fact(self, fact_id: int | str) -> dict[str, Any]:
         """Full record (incl. sources) for any fact, active or archived."""
+        fact_id = _fact_id(fact_id)
         with self._conn() as conn:
             row = conn.execute(
                 f"SELECT {_RECALL_COLUMNS} FROM facts WHERE id = ?", (fact_id,)
@@ -370,14 +492,15 @@ class Store:
         project = _project(project)
         if fact_id is not None:
             fact_id = _fact_id(fact_id)
-        kind = _kind(kind) if kind else None
+        kind = _kind(kind) if kind is not None else None
         tags = _tags(tags)
         limit = _limit(limit)
         min_confidence = _confidence(min_confidence) if min_confidence is not None else None
         query = _query(query)
 
         facts = self._select(project, kind=kind, min_confidence=min_confidence,
-                             active=True, fact_id=fact_id, query=query)
+                             active=True, fact_id=fact_id, query=query,
+                             limit=None if tags else limit)
         facts = [f for f in facts if set(f["tags"]) >= set(tags)]
         if fact_id is not None:
             # `id` pins the record: filters may narrow it, but a missing or
@@ -405,14 +528,15 @@ class Store:
         project = _project(project)
         if fact_id is not None:
             fact_id = _fact_id(fact_id)
-        kind = _kind(kind) if kind else None
+        kind = _kind(kind) if kind is not None else None
         tags = _tags(tags)
         limit = _limit(limit)
         min_confidence = _confidence(min_confidence) if min_confidence is not None else None
         query = _query(query)
 
         facts = self._select(project, kind=kind, min_confidence=min_confidence,
-                             active=False, fact_id=fact_id, query=query)
+                             active=False, fact_id=fact_id, query=query,
+                             limit=None if tags else limit)
         facts = [f for f in facts if set(f["tags"]) >= set(tags)]
         if fact_id is not None:
             # `id` pins the record: filters may narrow it, but a target that is
@@ -434,6 +558,7 @@ class Store:
         active: bool,
         fact_id: int | None,
         query: str | None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         if query is not None and self.fts and not _fts_terms(query):
             # FTS can't express an all-punctuation query as a match; it matches
@@ -459,11 +584,14 @@ class Store:
 
         if query is not None and self.fts:
             match = " ".join(_fts_terms(query))
+            # Relevance ranks active recall; the archive is always ordered by
+            # retirement time, query or not (scour = most recently archived).
+            order_by = "rank, id DESC" if active else order
             sql = (
                 f"SELECT {_RECALL_COLUMNS} FROM facts"
                 " JOIN facts_fts ON facts.id = facts_fts.rowid"
                 f" WHERE {' AND '.join(clauses)} AND facts_fts MATCH ?"
-                " ORDER BY rank, id DESC"
+                f" ORDER BY {order_by}"
             )
             params.append(match)
         elif query is not None:
@@ -478,15 +606,21 @@ class Store:
                 f"SELECT {_RECALL_COLUMNS} FROM facts"
                 f" WHERE {' AND '.join(clauses)} ORDER BY {order}"
             )
+        if limit is not None:
+            # Safe only when no tag filter remains: tags are filtered in Python
+            # and would otherwise be applied to a truncated row set.
+            sql += " LIMIT ?"
+            params.append(limit)
 
         with self._conn() as conn:
             rows = []
             for r in conn.execute(sql, params):
                 record = dict(r)
                 record["tags"] = json.loads(record["tags"])
-                if record["archived_at"] is None:
-                    # present once archived, per the fact model
-                    del record["archived_at"]
+                for nullable in ("archived_at", "supersedes"):
+                    if record[nullable] is None:
+                        # present once archived / once used, per the fact model
+                        del record[nullable]
                 rows.append(record)
             return rows
 
@@ -502,12 +636,12 @@ class Store:
     ) -> dict[str, Any]:
         """Retire a fact from active recall. Never removes the row."""
         fact_id = _fact_id(fact_id)
-        if note is not None and (not isinstance(note, str) or not note.strip()):
-            raise FactError("note must be a non-empty string")
-        agent = agent or self.default_agent
-        now = utc_now()
+        note = _note(note)
+        agent = _agent(agent, self.default_agent)
+        session = _session(session)
 
         with self._write() as conn:
+            now = utc_now()
             row = conn.execute(
                 f"SELECT {_RECALL_COLUMNS} FROM facts WHERE id = ?", (fact_id,)
             ).fetchone()
@@ -560,6 +694,70 @@ class Store:
                 "latest_activity": r["latest"],
             })
         return projects
+
+
+def _init_schema(conn: sqlite3.Connection) -> None:
+    """Create/upgrade the schema, then install the invariant guards.
+
+    `_SCHEMA` is idempotent, so concurrent first-use by several processes is
+    safe: they serialize on SQLite's lock and all observe the finished schema.
+    The migration and `user_version` bump run in one write transaction; the
+    column add has to happen before `_GUARDS` because a trigger may reference
+    it.
+    """
+    conn.executescript(_SCHEMA)
+    if conn.execute("PRAGMA user_version").fetchone()[0] < SCHEMA_VERSION:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Idempotent under a concurrent opener that migrated while we
+            # waited for the lock: the column check and version write are
+            # both safe to repeat.
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(facts)")}
+            if "supersedes" not in columns:
+                conn.execute(
+                    "ALTER TABLE facts ADD COLUMN supersedes INTEGER"
+                    " REFERENCES facts(id)"
+                )
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+    conn.executescript(_GUARDS)
+
+
+def _fts_doc_count(conn: sqlite3.Connection) -> int | None:
+    """Documents the mirror indexes, or None when it has no usable shadow table."""
+    try:
+        return conn.execute("SELECT COUNT(*) FROM facts_fts_docsize").fetchone()[0]
+    except sqlite3.OperationalError:
+        return None
+
+
+def _fts_ready(conn: sqlite3.Connection) -> bool:
+    """True when the mirror and trigger exist and index every fact.
+
+    Counting documents is the only reliable completeness test: an
+    external-content FTS table answers `SELECT ... FROM facts_fts` from
+    `facts` even when its index is empty, and a non-empty index may still be
+    missing facts written before the trigger existed. `facts_fts_docsize` has
+    one row per indexed document. Read-only and cheap, so a normal connection
+    can skip the write lock that `_setup_fts` takes only when the mirror must
+    be created or backfilled.
+    """
+    names = {
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master"
+            " WHERE name IN ('facts_fts', 'facts_fts_insert')"
+        )
+    }
+    if names != {"facts_fts", "facts_fts_insert"}:
+        return False
+    indexed = _fts_doc_count(conn)
+    if indexed is None:
+        return False  # shadow table missing: not a usable mirror
+    total = conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0]
+    return indexed == total
 
 
 def _fts_available() -> bool:

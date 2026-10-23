@@ -22,6 +22,8 @@ class Config:
         There is deliberately no cwd-derived default — the MCP process cwd is
         wherever the client launched it, not the agent's repo.
         """
+        if project is not None and not isinstance(project, str):
+            raise FactError(f"project must be a string, got {project!r}")
         if project is not None and project.strip():
             return project.strip()
         if self.default_project:

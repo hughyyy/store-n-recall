@@ -89,6 +89,18 @@ class LoadConfigTests(unittest.TestCase):
         with mock.patch.dict(os.environ, env, clear=True):
             self.assertEqual(load_config().agent, "unknown")
 
+    def test_xdg_data_home_with_trailing_slash(self):
+        env = dict(CLEAN_ENV, XDG_DATA_HOME="/opt/data/")
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg = load_config()
+        self.assertEqual(cfg.db_path, "/opt/data/store-n-recall/facts.db")
+
+    def test_default_project_and_agent_coexist(self):
+        env = dict(CLEAN_ENV, STORE_N_RECALL_PROJECT="p1", STORE_N_RECALL_AGENT="a1")
+        with mock.patch.dict(os.environ, env, clear=True):
+            cfg = load_config()
+        self.assertEqual((cfg.default_project, cfg.agent), ("p1", "a1"))
+
 
 class ResolveProjectTests(unittest.TestCase):
     """Param wins > env fallback > clear error. No cwd-derived default exists
@@ -124,6 +136,18 @@ class ResolveProjectTests(unittest.TestCase):
         cfg = self._cfg(default=None)
         with self.assertRaises(FactError):
             cfg.resolve_project("  ")
+
+    def test_non_string_param_is_rejected_even_with_a_default(self):
+        cfg = self._cfg(default="env-project")
+        for bad in (5, 0, True, [], {"project": "x"}):
+            with self.assertRaises(FactError, msg=repr(bad)):
+                cfg.resolve_project(bad)
+
+    def test_non_string_param_is_rejected_without_a_default(self):
+        cfg = self._cfg(default=None)
+        with self.assertRaises(FactError):
+            cfg.resolve_project([])
+
 
 
 if __name__ == "__main__":
