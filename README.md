@@ -6,9 +6,9 @@ so knowledge survives between agents and sessions. Third in the collection —
 [look-n-see](../look-n-see) (vision/OCR), [scrape-n-search](../scrape-n-search)
 (web), store-n-recall (project memory).
 
-> **Status: planned** — this README is the target surface. Implementation has not
-> started; tool names and env vars below are the design the first implementation
-> should follow.
+> **Status: implemented** — tools, env vars, and behavior below match the
+> server in `src/`. See `BRIEF.md` (requirements) and `IMPLEMENTATION.md`
+> (design).
 
 ## The idea
 
@@ -117,6 +117,7 @@ omit `STORE_N_RECALL_PROJECT` and pass `project` per call:
 | --- | --- | --- |
 | `STORE_N_RECALL_DB` | `~/.local/share/store-n-recall/facts.db` | store file path (honors `XDG_DATA_HOME`) |
 | `STORE_N_RECALL_PROJECT` | — | default project when a tool call omits `project` |
+| `STORE_N_RECALL_AGENT` | `unknown` | provenance agent name when the MCP client supplies none |
 
 ## Non-goals
 
@@ -129,9 +130,8 @@ omit `STORE_N_RECALL_PROJECT` and pass `project` per call:
 
 ## Development
 
-(once implemented)
-
 ```bash
+python3 -m venv .venv
 .venv/bin/pip install -e .
 .venv/bin/python -m unittest discover -s tests -q   # offline suite
 ```

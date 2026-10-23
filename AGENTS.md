@@ -4,9 +4,8 @@
 
 MCP server giving agents a persistent, lightweight knowledgebase: store and recall
 facts about projects, so knowledge survives between agents and sessions. Third in
-the collection (look-n-see, scrape-n-search). **Status: design captured,
-implementation not started** — the design lives in `README.md` (planned tool
-surface, storage, config) and `CONTEXT.md` (vocabulary).
+the collection (look-n-see, scrape-n-search). **Status: implemented** — the server in `src/` matches the design in
+`README.md`; requirements in `BRIEF.md`, design decisions in `IMPLEMENTATION.md`.
 
 ## Conventions
 
